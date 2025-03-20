@@ -1,0 +1,16 @@
+vllm==0.5.3.post1
+transformers
+sacrebleu
+accelerate
+spacy
+datasets
+rouge-score
+sentence-splitter
+wandb
+grakel
+huggingface_hub==0.27.0
+bm25s[full]
+rank_bm25
+sentencepiece
+unbabel-comet
+scikit-learn
