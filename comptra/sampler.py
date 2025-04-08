@@ -25,6 +25,8 @@ from comptra.utils import (
 from comptra.languages import MAPPING_LANG_TO_KEY, NON_FLORES
 from comptra.apply_chat_template import apply_chat_template
 
+from accelerate import Accelerator
+
 STOP_WORDS = [
     "###",
     "\n" * 5,
@@ -50,6 +52,7 @@ STOP_WORDS = [
     "\nNote:",
     "<end_of_turn>",
     "<EOS_TOKEN>",
+    "assistant<|end_header_id|>",
 ]
 
 MAX_NUMBER_OF_PROPOSITIONS = 8
@@ -93,7 +96,7 @@ class Sampler:
         method_translate: str,
         selection_method: str,
         nllb_name_or_path: str,
-        method_divide: str = None
+        method_divide: str = None,
     ):
         self.model_name_or_path = model_name_or_path
         self.tokenizer_name_or_path = tokenizer_name_or_path
@@ -110,7 +113,7 @@ class Sampler:
         print(
             f"We use {'a pretrained' * (not self.ift) + 'an instruction fine-tuned' * self.ift} model!"
         )
-        if method_translate == "nllb":
+        if method_translate in ["nllb", "cod"]:
             from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
             self.nllb = AutoModelForSeq2SeqLM.from_pretrained(
@@ -122,6 +125,7 @@ class Sampler:
                 #    if torch.cuda.is_available()
                 #    else None
                 # ),
+                # torch_dtype=torch.float16
             )
             self.nllb_tokenizer = AutoTokenizer.from_pretrained(nllb_name_or_path)
             self.nllb_tokenizer.src_lang = MAPPING_LANG_TO_KEY[self.src]
@@ -138,13 +142,15 @@ class Sampler:
             print(f"We are going to use Step-by-Step Translation.")
         elif method_translate == "TEaR":
             print("We are going to use TEaR.")
+        elif method_translate == "cod":
+            print("We are going to use Chain-of-Dictionary (CoD).")
         else:
             pass
 
         print(
             f"Merge algorithm: {self.merge_prompt}, selection method: {self.selection_method}"
         )
-    
+
     def update_src(self, src):
         self.src = src
 
@@ -260,7 +266,9 @@ class Sampler:
                     sentence,
                     src=self.src,
                     tgt=self.tgt,
-                    demonstrations=demonstrations[i] if (demonstrations and demonstrations[i]) else [],
+                    demonstrations=demonstrations[i]
+                    if (demonstrations and demonstrations[i])
+                    else [],
                     template=self.template,
                     ift=self.ift,
                 )
@@ -369,6 +377,20 @@ class Sampler:
                 verbose=verbose,
             )
             return outputs
+        elif self.method_translate == "cod":
+            outputs = self.cod(
+                sentences=sentences,
+                max_new_tokens=max(1500, max_new_tokens),
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                num_return_sequences=num_return_sequences,
+                num_beams=num_beams,
+                do_sample=do_sample,
+                request_batch_size=request_batch_size,
+                verbose=verbose,
+            )
+            return outputs
         elif self.method_translate in ["pos", "morph", "dep", "ner", "none"]:
             prompts = [
                 get_linguistic_prompt(
@@ -439,7 +461,9 @@ class Sampler:
         - n_splits: int,
             Number of entities to divide into.
         """
-        prompts = [get_divide_prompt(sentence, self.method_divide) for sentence in sentences]
+        prompts = [
+            get_divide_prompt(sentence, self.method_divide) for sentence in sentences
+        ]
         # prompts = [self.apply_chat_template(prompt) for prompt in prompts] # Not needed
         outputs = []
         for i in range(0, len(prompts), request_batch_size):
@@ -658,6 +682,145 @@ class Sampler:
                 src=self.src,
                 tgt=self.tgt,
                 strategy=self.merge_prompt,
+            )
+            for sentence, output in zip(sentences, outputs)
+        ]
+
+        return translations
+
+    def cod(
+        self,
+        sentences: List[str],
+        max_new_tokens: int = 100,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        num_return_sequences: int = 1,
+        num_beams: int = 1,
+        do_sample: bool = False,
+        request_batch_size: int = 8,
+        verbose: bool = True,
+    ):
+        translation_prompts = []
+        for i in range(0, len(sentences), request_batch_size):
+            inputs = sentences[i : min(i + request_batch_size, len(sentences))]
+            prompts = [
+                self.apply_chat_template(
+                    f"Extract the words from the following text: {sentence}\n"
+                    # + "Do not include very common or stop words (articles, pronouns, prepositions, conjunctions etc.) and make sure to only return the words as a numbered list (1., 2. etc.), nothing more."
+                    + "Make sure to only return the words as a numbered list (1., 2. etc.), nothing more."
+                )
+                for sentence in inputs
+            ]
+            outputs = self.generate(
+                prompts=prompts,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                num_return_sequences=num_return_sequences,
+                num_beams=num_beams,
+                do_sample=do_sample,
+                request_batch_size=request_batch_size,
+                verbose=verbose,
+            )
+            pattern = r"(?m)^\s*\d+\.\s*(.+)"
+            list_of_words = [
+                re.findall(pattern, list_of_texts[0].strip())
+                for list_of_texts in outputs
+            ]
+            list_of_words = [
+                [word.strip() for word in words if word.strip() != ""]
+                for words in list_of_words
+            ]
+            for words in list_of_words:
+                print(words)
+            flattened_list_of_words = [
+                element for words in list_of_words for element in words
+            ]
+            print(f"Len(flattened_list_of_words): {len(flattened_list_of_words)}")
+            dico_of_translations = {}
+            # Translate each word into the three intermediate languages as well as into the target language
+            for language in ["French", "German", "Portuguese", self.tgt]:
+                outputs = []
+                # Batching to avoid Cuda OOM
+                for j in range(0, len(flattened_list_of_words), request_batch_size):
+                    batch_inputs = flattened_list_of_words[
+                        j : min(j + request_batch_size, len(flattened_list_of_words))
+                    ]
+                    inputs_tensor = self.nllb_tokenizer(
+                        batch_inputs, return_tensors="pt", padding=True
+                    ).to(self.nllb.device)
+                    # print(f"input_tensor.input_ids: {inputs_tensor['input_ids'].shape}")
+                    translated_tokens = self.nllb.generate(
+                        **inputs_tensor,
+                        forced_bos_token_id=self.nllb_tokenizer.convert_tokens_to_ids(
+                            MAPPING_LANG_TO_KEY[language]
+                        ),
+                        max_new_tokens=min(30, max_new_tokens),
+                        temperature=temperature,
+                        top_p=top_p,
+                        num_beams=num_beams,
+                        repetition_penalty=repetition_penalty,
+                        num_return_sequences=num_return_sequences,
+                        do_sample=do_sample,
+                    )
+
+                    batch_outputs = self.nllb_tokenizer.batch_decode(
+                        translated_tokens, skip_special_tokens=True
+                    )
+                    outputs.extend(batch_outputs)
+                dico_of_translations[language] = outputs
+            
+            prompts = []
+            start = 0
+            for j in range(len(inputs)):
+                prompt = ""
+                for k in range(len(list_of_words[j])):
+                    src = list_of_words[j][k]
+                    fra, deu, pt, tgt = (
+                        dico_of_translations["French"][start + k],
+                        dico_of_translations["German"][start + k],
+                        dico_of_translations["Portuguese"][start + k],
+                        dico_of_translations[self.tgt][start + k],
+                    )
+                    prompt += f'"{src}" means "{fra}" means "{deu}" means "{pt}" means "{tgt}".\n'
+                prompt = f"{prompt}\nTranslate the following text from {self.src} into {self.tgt}: {inputs[j]}"
+                prompt += "\n\nPlease provide only the translation, nothing more."
+                prompt = self.apply_chat_template(prompt)
+                start += len(list_of_words[j])
+                prompts.append(prompt)
+            print(f"{'-' * 50}\n{prompts[0]}\n{'-' * 50}")
+            translation_prompts.extend(prompts)
+        # Final translation with CoD prompts
+        outputs = self.generate(
+            prompts=translation_prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            num_return_sequences=num_return_sequences,
+            num_beams=num_beams,
+            do_sample=do_sample,
+            request_batch_size=request_batch_size,
+            verbose=verbose,
+        )
+        # Postprocess the output
+        translations = [
+            get_best_sentence(
+                target_translations=[
+                    remove_repeating_bigram(
+                        extract_translation(
+                            sentence=_stop_at_stop_token(output[i], STOP_WORDS),
+                            method=self.merge_prompt,
+                        )
+                    )
+                    for i in range(len(output))
+                ],
+                source_sentence=sentence,
+                src=self.src,
+                tgt=self.tgt,
+                strategy="greedy",
             )
             for sentence, output in zip(sentences, outputs)
         ]
@@ -1193,15 +1356,13 @@ class cohereSampler(Sampler):
         self.api_key = (
             api_key
             if api_key
-            else os.environ.get(
-                "COHERE_API_KEY", "<YOUR_COHERE_API_KEY>"
-            )
+            else os.environ.get("COHERE_API_KEY", "<YOUR_COHERE_API_KEY>")
         )
         self.client = cohere.Client(self.api_key)
 
     def generate(
         self,
-        #prompts: List[str],
+        # prompts: List[str],
         prompts,
         max_new_tokens: int,
         temperature: float = 0.0,
@@ -1452,9 +1613,10 @@ import anthropic
 class AnthropicSampler(Sampler):
     def __init__(self, api_key, max_retry=3, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.api_key = api_key if api_key else os.environ.get(
-            "ANTHROPIC_API_KEY",
-            "YOU_ANTHROPIC_API_KEY"
+        self.api_key = (
+            api_key
+            if api_key
+            else os.environ.get("ANTHROPIC_API_KEY", "YOU_ANTHROPIC_API_KEY")
         )
         self.max_retry = max_retry
         self.client = anthropic.Anthropic(api_key=self.api_key)
