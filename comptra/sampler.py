@@ -1753,6 +1753,7 @@ class vLLMSampler(Sampler):
                 swap_space=8,
                 enable_lora=enable_lora,
                 max_lora_rank=max_lora_rank,
+                tensor_parallel_size=torch.cuda.device_count()
             )
 
     def generate(
