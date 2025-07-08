@@ -1778,7 +1778,7 @@ class vLLMSampler(Sampler):
         self.sampling_params.max_tokens = max_new_tokens
         self.sampling_params.n = num_return_sequences
         self.sampling_params.skip_special_tokens = True
-        self.sampling_params.ignore_eos = True
+        self.sampling_params.ignore_eos = False
 
         if isinstance(prompts, list):
             pass
